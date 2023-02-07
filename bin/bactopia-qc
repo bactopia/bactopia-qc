@@ -1,0 +1,178 @@
+#! /bin/bash
+VERSION=1.0.0
+PREFIX=$1
+RUNTYPE=$2
+R1=$3
+R2=$4
+GENOME_SIZE_FILE=$5
+
+# If no user input, print usage
+if [[ $# == 0 ]]; then
+    echo "bactopia-gather - v${VERSION}"
+    echo ""
+    echo "bactopia-gather <PREFIX> <RUNTYPE> <R1> <R2> <GENOME_SIZE_FILE> <OPT1> ... <OPTN>"
+    echo ""
+    exit
+fi
+
+mkdir -p results
+touch results/.${RUNTYPE}
+ERROR=0
+GENOME_SIZE=`head -n 1 ${GENOME_SIZE_FILE}`
+if [[ "${RUNTYPE}" == "ont" ]]; then
+    # Remove Adapters
+    porechop --input ${R1} !{params.porechop_opts} \
+        --format fastq \
+        --threads !{task.cpus} > adapter-r1.fq
+    # Quality filter
+    nanoq --input adapter-r1.fq 1> filt-r1.fq
+else
+    # Illumina Reads
+    # Validate paired-end reads if necessary
+    # Make sure paired-end reads have matching IDs
+    repair.sh \
+        in=${R1} \
+        in2=${R2} \
+        out=repair-r1.fq \
+        out2=repair-r2.fq \
+        outs=repair-singles.fq \
+        ain=!{params.ain}
+    if [ ! -s repair-r1.fq ]; then
+        ERROR=1
+        echo "After validating read pairs, ${PREFIX} FASTQs are empty. Please check the input FASTQs.
+            Further analysis is discontinued." | \
+        sed 's/^\\s*//' >> ${PREFIX}-paired-match-error.txt
+    fi
+    if [ "${ERROR}" -eq "0" ]; then
+        # Remove Adapters
+        bbduk.sh -Xmx!{xmx} \
+            in=repair-r1.fq out=adapter-r1.fq \
+            in=repair-r2.fq out=adapter-r2.fq
+        if [ ! -s adapter-r1.fq ]; then
+            ERROR=1
+            echo "After adapter removal, ${PREFIX} FASTQs are empty. Please check the input FASTQs.
+                Further analysis is discontinued." | \
+            sed 's/^\\s*//' >> ${PREFIX}-adapter-qc-error.txt
+        fi
+    fi
+    if [ "${ERROR}" -eq "0" ]; then
+        # Remove PhiX
+        bbduk.sh -Xmx!{xmx} \
+            in=adapter-r1.fq out=phix-r1.fq \
+            in=adapter-r2.fq out=phix-r2.fq
+        if [ ! -s phix-r1.fq ]; then
+            ERROR=1
+            echo "After PhiX removal, ${PREFIX} FASTQs are empty. Please check the input FASTQs.
+                Further analysis is discontinued." | \
+            sed 's/^\\s*//' >> ${PREFIX}-phix-qc-error.txt
+        fi
+    fi
+fi
+
+# Reduce Coverage
+if [ "${ERROR}" -eq "0" ]; then
+    if (( ${TOTAL_BP} > 0 )); then
+        if [[ "${RUNTYPE}" == "ont" ]]; then
+            rasusa -i filt-r1.fq \
+                -g ${GENOME_SIZE} 1> subsample-r1.fq
+        else
+            if [ -f filt-r1.fq ]; then
+                reformat.sh \
+                    in=filt-r1.fq out=subsample-r1.fq \
+                    samplebasestarget=${TOTAL_BP} \
+                    overwrite=t
+            fi
+        fi
+    else
+        echo "Skipping coverage reduction"
+    fi
+fi
+# Compress
+if [ "${ERROR}" -eq "0" ]; then
+    pigz -c -n subsample-r1.fq > results/${PREFIX}_R1.fastq.gz
+    pigz -c -n subsample-r2.fq > results/${PREFIX}_R2.fastq.gz
+fi
+
+# Quality stats before and after QC
+if [ "${ERROR}" -eq "0" ]; then
+    mkdir -p results/summary/
+    # fastq-scan
+    # Paired-End Reads
+    gzip -cd ${R1} | fastq-scan -g ${GENOME_SIZE} > results/summary/${PREFIX}_R1-original.json
+    gzip -cd ${R2} | fastq-scan -g ${GENOME_SIZE} > results/summary/${PREFIX}_R2-original.json
+    gzip -cd results/${PREFIX}_R1.fastq.gz | fastq-scan -g ${GENOME_SIZE} > results/summary/${PREFIX}_R1-final.json
+    gzip -cd results/${PREFIX}_R2.fastq.gz | fastq-scan -g ${GENOME_SIZE} > results/summary/${PREFIX}_R2-final.json
+    # FastQC and NanoPlot
+    if [[ "${RUNTYPE}" == "ont" ]]; then
+        mkdir results/summary/${PREFIX}-original results/summary/${PREFIX}-final
+        NanoPlot --fastq ${R1} \
+            --outdir results/summary/${PREFIX}-original/ \
+            --prefix ${PREFIX}-original_
+        cp results/summary/${PREFIX}-original/${PREFIX}-original_NanoPlot-report.html results/summary/${PREFIX}-original_NanoPlot-report.html
+        tar -cvf - results/summary/${PREFIX}-original/ | pigz --best > results/summary/${PREFIX}-original_NanoPlot.tar.gz
+        NanoPlot --fastq results/${PREFIX}.fastq.gz \
+            --outdir results/summary/${PREFIX}-final/ \
+            --prefix ${PREFIX}-final_
+        cp results/summary/${PREFIX}-final/${PREFIX}-final_NanoPlot-report.html results/summary/${PREFIX}-final_NanoPlot-report.html
+        tar -cvf - results/summary/${PREFIX}-final/ | pigz --best > results/summary/${PREFIX}-final_NanoPlot.tar.gz
+        rm -rf results/summary/${PREFIX}-original/ results/summary/${PREFIX}-final/
+    else
+        # Paired-End Reads
+        ln -s ${R1} ${PREFIX}_R1-original.fastq.gz
+        ln -s ${R2} ${PREFIX}_R2-original.fastq.gz
+        ln -s results/${PREFIX}_R1.fastq.gz ${PREFIX}_R1-final.fastq.gz
+        ln -s results/${PREFIX}_R2.fastq.gz ${PREFIX}_R2-final.fastq.gz
+        fastqc --noextract -f fastq ${PREFIX}_R1-original.fastq.gz ${PREFIX}_R2-original.fastq.gz ${PREFIX}_R1-final.fastq.gz ${PREFIX}_R2-final.fastq.gz
+        mv *_fastqc.html *_fastqc.zip results/summary/
+    fi
+fi
+
+# Final QC check
+# Only check for errors if we haven't already found them
+if [ "${ERROR}" -eq "0" ]; then
+    gzip -cd results/*.fastq.gz | fastq-scan -g ${GENOME_SIZE} > temp.json
+    FINAL_BP=$(grep "total_bp" temp.json | sed -r 's/.*:[ ]*([0-9]+),/\\1/')
+    rm temp.json
+    # Check paired-end reads have same read counts
+    OPTS="--sample ${PREFIX} --runtype ${RUNTYPE}"
+    if [ -f  "results/${PREFIX}_R2.fastq.gz" ]; then
+        # Paired-end
+        gzip -cd results/${PREFIX}_R1.fastq.gz | fastq-scan > r1.json
+        gzip -cd results/${PREFIX}_R2.fastq.gz | fastq-scan > r2.json
+        if ! reformat.sh in1=results/${PREFIX}_R1.fastq.gz in2=results/${PREFIX}_R2.fastq.gz out=/dev/null 2> ${PREFIX}-paired-end-error.txt; then
+            ERROR=2
+            echo "${PREFIX} FASTQs contains an error. Please check the input FASTQs.
+                Further analysis is discontinued." | \
+            sed 's/^\\s*//' >> ${PREFIX}-paired-end-error.txt
+        else
+            rm -f ${PREFIX}-paired-end-error.txt
+        fi
+        if ! check-fastqs.py --fq1 r1.json --fq2 r2.json ${OPTS}; then
+            ERROR=2
+        fi
+        rm r1.json r2.json
+    else
+        # Single-end
+        gzip -cd results/${PREFIX}.fastq.gz | fastq-scan > r1.json
+        if ! check-fastqs.py --fq1 r1.json ${OPTS}; then
+            ERROR=2
+        fi
+        rm r1.json
+    fi
+fi
+
+if [ "${ERROR}" -eq "1" ]; then
+    cp ${R1} results/${PREFIX}_R1.error-fastq.gz
+    cp ${R2} results/${PREFIX}_R2.error-fastq.gz
+    if [ ! -s repair-singles.fq ]; then
+        pigz -c -n repair-singles.fq > results/${PREFIX}.error-fastq.gz
+    fi
+elif [ "${ERROR}" -eq "2" ]; then
+    if [ -f results/${PREFIX}_R1.fastq.gz ]; then
+        mv results/${PREFIX}_R1.fastq.gz results/${PREFIX}_R1.error-fastq.gz
+        mv results/${PREFIX}_R2.fastq.gz results/${PREFIX}_R2.error-fastq.gz
+        if [ -s repair-singles.fq ]; then
+            pigz -c -n repair-singles.fq > results/${PREFIX}.error-fastq.gz
+        fi
+    fi
+fi
