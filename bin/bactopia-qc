@@ -8,10 +8,15 @@ GENOME_SIZE_FILE=$5
 
 # If no user input, print usage
 if [[ $# == 0 ]]; then
-    echo "bactopia-gather - v${VERSION}"
+    echo "bactopia-qc - v${VERSION}"
     echo ""
-    echo "bactopia-gather <PREFIX> <RUNTYPE> <R1> <R2> <GENOME_SIZE_FILE> <OPT1> ... <OPTN>"
+    echo "bactopia-qc <PREFIX> <RUNTYPE> <R1> <R2> <GENOME_SIZE_FILE> <OPT1> ... <OPTN>"
     echo ""
+    exit
+fi
+
+if [[ "$1" == "version" ]] || [[ "$1" == "--version" ]]; then
+    echo "bactopia-qc ${VERSION}"
     exit
 fi
 
